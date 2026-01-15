@@ -1,0 +1,20 @@
+#ignore local configuration files
+_build/
+build/
+.settings/
+sdk/components/toolchain/gcc/Makefile.windows
+.cproject
+.project
+*.pyc
+doc/*.acn
+doc/*.aux
+doc/*.glo
+doc/*.glsdefs
+doc/*.ist
+doc/*.log
+doc/*.out
+doc/*.synctex.gz
+doc/*.toc
+#but keep configuration files inside dependencies
+!dep/**
+
