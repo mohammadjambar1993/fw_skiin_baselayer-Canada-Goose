@@ -43,49 +43,49 @@ void config_ram_ret(void);
 // AUTO-START: 2 CHANNELS (A & B) @ MAX POWER
 // NO PHONE REQUIRED
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// AUTO-START: ALL 4 CHANNELS (A, B, C, D)
+// ---------------------------------------------------------
 void auto_start_heat_task(void * pvParameters)
 {
-    // 1. Wait 3 seconds for power bank to wake up
+    // Wait for power to stabilize
     vTaskDelay(pdMS_TO_TICKS(3000)); 
 
-    log_info(">> STARTING: DUAL CHANNEL MAX HEAT <<");
+    // --- USER SETTING: CHANGE POWER HERE ---
+    // Set this to 100 for MAX. 
+    // If battery crashes/shuts off, try 75 or 50.
+    uint8_t target_duty = 100; 
+    // ---------------------------------------
+
+    log_info(">> STARTING: ALL 4 CHANNELS at %d%% Duty Cycle <<", target_duty);
 
     cmd_heat_params_t auto_params;
     memset(&auto_params, 0, sizeof(cmd_heat_params_t));
 
-    // Set duration to 12 hours
-    auto_params.timeout_secs = 43200; 
-
-    // --- VOLTAGE SETTING ---
-    // Start with default Voltage (usually 5V).
-    // 2 Channels @ 5V = ~12 Watts (Good Heat).
-    // If you change this to 9, you might crash the battery (38 Watts!).
+    auto_params.timeout_secs = 43200; // 12 Hours
     auto_params.voltage = hw_get_current_voltage(); 
     auto_params.pwm_period = hw_get_default_period_count();
 
-    // --- POWER SETTING ---
-    // We turn ON Channel A (0) and Channel B (1) to 100%
-    // We turn OFF Channel C (2) and Channel D (3) to save battery
-    
-    auto_params.data[0] = 100; // Channel A -> MAX
-    auto_params.data[1] = 100; // Channel B -> MAX
-    auto_params.data[2] = 0;   // Channel C -> OFF
-    auto_params.data[3] = 0;   // Channel D -> OFF
+    // Apply the Duty Cycle to ALL 4 Channels
+    auto_params.data[0] = target_duty; // Channel A
+    auto_params.data[1] = target_duty; // Channel B
+    auto_params.data[2] = target_duty; // Channel C
+    auto_params.data[3] = target_duty; // Channel D
 
     // Send Command
     app_status_t status = heat_set_channels(&auto_params);
 
     if (status == APPST_SUCCESS) {
-        log_info(">> SUCCESS: Channels A & B set to 100% <<");
+        log_info(">> SUCCESS: All Channels Activated <<");
     } else {
         log_error(">> ERROR: %d <<", status);
     }
 
-    // Monitor Voltage in Logs
+    // Monitor Voltage
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         uint16_t v = hw_get_current_voltage();
-        log_info(">> VOLTAGE CHECK: %d mV <<", v);
+        log_info(">> VOLTAGE: %d mV | ALL CHANNELS: %d%% <<", v, target_duty);
     }
 }
 // ---------------------------------------------------------
