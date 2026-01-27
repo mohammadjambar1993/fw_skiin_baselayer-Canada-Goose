@@ -774,41 +774,13 @@ static void update_duties_config(uint8_t *duties)
 // -------------------------------------------------------------
 static void update_hw_duties(uint8_t *duties)
 {
-    uint8_t i;
-    heater_id_t ch;
-    app_status_t st;
-    channel_ctl_t *ctl = heat_channels;
-
-    for(i = 0, ch = HEATER_A; i < MAX_HEATERS; i++, ch++, ctl++)
-    {
-        // Check if channel is enabled in hardware settings
-        if(!hw_is_channel_enabled(ch))
-            continue;
-
-        // SKIP INVALID VALUES
-        if (duties[i] == INVALID_DUTY_CYCLE) 
-            continue;
-
-        // --- THE FIX IS HERE ---
-        // OLD CODE used: channel_configs[i] (This was the toggling value)
-        // NEW CODE uses: duties[i]          (This is your direct 100% command)
-        
-        uint8_t target_val = duties[i]; 
-
-        // Apply the duty cycle directly to the hardware
-        if(ctl->measures.dutycycle != target_val)
-        {
-            st = hw_set_dutycycle(ch, target_val);
-            if(APPST_SUCCESS != st)
-            {
-                _warn("failed to set ch %d, duty %d: %d", ch, target_val, st);
-            }
-            else
-            {
-                _debug("Force setting channel %d to %d %%", ch, target_val);
-            }
-        }
+    // ... loop variables ...
+    // Force direct value:
+    uint8_t target_val = duties[i]; 
+    if(ctl->measures.dutycycle != target_val) {
+        hw_set_dutycycle(ch, target_val);
     }
+    // ...
 }
 
 

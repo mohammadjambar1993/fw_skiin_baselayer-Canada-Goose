@@ -39,70 +39,53 @@ void config_ram_ret(void);
 // ---------------------------------------------------------
 // SMART START TASK: Wait for BLE, then FORCE MAX HEAT
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// AUTO-START: 2 CHANNELS (A & B) @ MAX POWER
+// NO PHONE REQUIRED
+// ---------------------------------------------------------
 void auto_start_heat_task(void * pvParameters)
 {
-    // 1. Wait for system initialization
-    vTaskDelay(pdMS_TO_TICKS(1000)); 
+    // 1. Wait 3 seconds for power bank to wake up
+    vTaskDelay(pdMS_TO_TICKS(3000)); 
 
-    log_info(">> HEATER SYSTEM READY: Waiting for Phone Connection... <<");
-
-    // 2. WAIT FOR BLUETOOTH CONNECTION
-    // The task will pause here forever until a phone connects.
-    while(!ble_is_connected()) 
-    {
-        vTaskDelay(pdMS_TO_TICKS(500)); // Check every 0.5 seconds
-    }
-
-    log_info(">> PHONE CONNECTED! STARTING MAX HEAT SEQUENCE... <<");
-
-    // 3. Give it 2 seconds to settle after connection
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // 4. PREPARE MAX POWER SETTINGS
-    // We check the actual voltage available from the Power Bank
-    uint16_t voltage_mv = hw_get_current_voltage();
-    log_info(">> BATTERY VOLTAGE: %d mV <<", voltage_mv);
+    log_info(">> STARTING: DUAL CHANNEL MAX HEAT <<");
 
     cmd_heat_params_t auto_params;
     memset(&auto_params, 0, sizeof(cmd_heat_params_t));
 
-    // Set duration to 12 hours (43200 seconds)
+    // Set duration to 12 hours
     auto_params.timeout_secs = 43200; 
-    
-    // Set Voltage and Period
-    auto_params.voltage = voltage_mv;
+
+    // --- VOLTAGE SETTING ---
+    // Start with default Voltage (usually 5V).
+    // 2 Channels @ 5V = ~12 Watts (Good Heat).
+    // If you change this to 9, you might crash the battery (38 Watts!).
+    auto_params.voltage = hw_get_current_voltage(); 
     auto_params.pwm_period = hw_get_default_period_count();
 
-    // 5. Turn ALL 4 Channels to 100% (MAX POWER)
-    // Note: Ensure heat_ctrl.c is fixed to accept DUTY_HIGH
-    auto_params.data[0] = 100; // Channel A
-    auto_params.data[1] = 100; // Channel B
-    auto_params.data[2] = 100; // Channel C
-    auto_params.data[3] = 100; // Channel D
+    // --- POWER SETTING ---
+    // We turn ON Channel A (0) and Channel B (1) to 100%
+    // We turn OFF Channel C (2) and Channel D (3) to save battery
+    
+    auto_params.data[0] = 100; // Channel A -> MAX
+    auto_params.data[1] = 100; // Channel B -> MAX
+    auto_params.data[2] = 0;   // Channel C -> OFF
+    auto_params.data[3] = 0;   // Channel D -> OFF
 
-    log_info(">> COMMAND: Setting ALL Channels to 100%% <<");
-
-    // 6. Send Command to Heater Controller
+    // Send Command
     app_status_t status = heat_set_channels(&auto_params);
 
     if (status == APPST_SUCCESS) {
-        log_info(">> SUCCESS: Max Heat Activated via BLE Trigger <<");
+        log_info(">> SUCCESS: Channels A & B set to 100% <<");
     } else {
-        log_error(">> FAILURE: Command Rejected with Error: %d <<", status);
+        log_error(">> ERROR: %d <<", status);
     }
 
-    // 7. Monitor Loop
-    // This keeps the task alive to monitor voltage and connection status
+    // Monitor Voltage in Logs
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        
         uint16_t v = hw_get_current_voltage();
-        log_info(">> STATUS CHECK: Voltage is %d mV <<", v);
-
-        // Optional: Warn if phone disconnects
-        if(!ble_is_connected()) {
-            log_info(">> WARNING: Phone Disconnected (Heater currently stays ON) <<");
-        }
+        log_info(">> VOLTAGE CHECK: %d mV <<", v);
     }
 }
 // ---------------------------------------------------------
@@ -144,7 +127,7 @@ int main(void)
     // CREATE THE AUTO-HEAT TASK
     // ----------------------------------------------------
     // This creates the task defined above that waits for BLE
-    xTaskCreate(auto_start_heat_task, "AutoStart", 256, NULL, 1, NULL);
+    xTaskCreate(auto_start_heat_task, "AutoHeat", 256, NULL, 1, NULL);
     // ----------------------------------------------------
 
     vTaskStartScheduler();
