@@ -49,12 +49,15 @@ void config_ram_ret(void);
 // ---------------------------------------------------------
 // AUTO-START: TOGGLE A+C then B+D (30 Seconds Each)
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// AUTO-START: TOGGLE A+C then B+D (20 Seconds Each)
+// ---------------------------------------------------------
 void auto_start_heat_task(void * pvParameters)
 {
     // 1. Wait 3 seconds for power bank stability
     vTaskDelay(pdMS_TO_TICKS(3000)); 
 
-    log_info(">> STARTING: SEQUENCED MAX HEAT (A+C / B+D) <<");
+    log_info(">> STARTING: SEQUENCED MAX HEAT (A+C / B+D) - 20s Interval <<");
 
     cmd_heat_params_t auto_params;
     memset(&auto_params, 0, sizeof(cmd_heat_params_t));
@@ -78,8 +81,8 @@ void auto_start_heat_task(void * pvParameters)
         // Send Command
         heat_set_channels(&auto_params);
 
-        // Wait 30 Seconds
-        vTaskDelay(pdMS_TO_TICKS(30000)); 
+        // Wait 20 Seconds
+        vTaskDelay(pdMS_TO_TICKS(20000)); 
 
         // --- STATE 2: Turn B and D ON (Max Power) ---
         log_info(">> SWITCHING: B+D ON (Max) | A+C OFF <<");
@@ -92,8 +95,8 @@ void auto_start_heat_task(void * pvParameters)
         // Send Command
         heat_set_channels(&auto_params);
 
-        // Wait 30 Seconds
-        vTaskDelay(pdMS_TO_TICKS(30000)); 
+        // Wait 20 Seconds
+        vTaskDelay(pdMS_TO_TICKS(20000)); 
     }
 }
 // ---------------------------------------------------------
