@@ -46,46 +46,54 @@ void config_ram_ret(void);
 // ---------------------------------------------------------
 // AUTO-START: ALL 4 CHANNELS (A, B, C, D)
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// AUTO-START: TOGGLE A+C then B+D (30 Seconds Each)
+// ---------------------------------------------------------
 void auto_start_heat_task(void * pvParameters)
 {
-    // Wait for power to stabilize
+    // 1. Wait 3 seconds for power bank stability
     vTaskDelay(pdMS_TO_TICKS(3000)); 
 
-    // --- USER SETTING: CHANGE POWER HERE ---
-    // Set this to 100 for MAX. 
-    // If battery crashes/shuts off, try 75 or 50.
-    uint8_t target_duty = 100; 
-    // ---------------------------------------
-
-    log_info(">> STARTING: ALL 4 CHANNELS at %d%% Duty Cycle <<", target_duty);
+    log_info(">> STARTING: SEQUENCED MAX HEAT (A+C / B+D) <<");
 
     cmd_heat_params_t auto_params;
     memset(&auto_params, 0, sizeof(cmd_heat_params_t));
 
+    // General Settings
     auto_params.timeout_secs = 43200; // 12 Hours
     auto_params.voltage = hw_get_current_voltage(); 
     auto_params.pwm_period = hw_get_default_period_count();
 
-    // Apply the Duty Cycle to ALL 4 Channels
-    auto_params.data[0] = target_duty; // Channel A
-    auto_params.data[1] = target_duty; // Channel B
-    auto_params.data[2] = target_duty; // Channel C
-    auto_params.data[3] = target_duty; // Channel D
+    // 2. Infinite Loop to Toggle Groups
+    while(1)
+    {
+        // --- STATE 1: Turn A and C ON (Max Power) ---
+        log_info(">> SWITCHING: A+C ON (Max) | B+D OFF <<");
+        
+        auto_params.data[0] = 100; // A = ON
+        auto_params.data[1] = 0;   // B = OFF
+        auto_params.data[2] = 100; // C = ON
+        auto_params.data[3] = 0;   // D = OFF
 
-    // Send Command
-    app_status_t status = heat_set_channels(&auto_params);
+        // Send Command
+        heat_set_channels(&auto_params);
 
-    if (status == APPST_SUCCESS) {
-        log_info(">> SUCCESS: All Channels Activated <<");
-    } else {
-        log_error(">> ERROR: %d <<", status);
-    }
+        // Wait 30 Seconds
+        vTaskDelay(pdMS_TO_TICKS(30000)); 
 
-    // Monitor Voltage
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        uint16_t v = hw_get_current_voltage();
-        log_info(">> VOLTAGE: %d mV | ALL CHANNELS: %d%% <<", v, target_duty);
+        // --- STATE 2: Turn B and D ON (Max Power) ---
+        log_info(">> SWITCHING: B+D ON (Max) | A+C OFF <<");
+
+        auto_params.data[0] = 0;   // A = OFF
+        auto_params.data[1] = 100; // B = ON
+        auto_params.data[2] = 0;   // C = OFF
+        auto_params.data[3] = 100; // D = ON
+
+        // Send Command
+        heat_set_channels(&auto_params);
+
+        // Wait 30 Seconds
+        vTaskDelay(pdMS_TO_TICKS(30000)); 
     }
 }
 // ---------------------------------------------------------
