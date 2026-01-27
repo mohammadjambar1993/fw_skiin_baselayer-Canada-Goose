@@ -484,6 +484,9 @@ static void update_hw_voltage(uint8_t newvoltage)
 // ROBUST SYNC: (A+C) vs (B+D)
 // FORCE UPDATES: Ensures commands are always sent
 // --------------------------------------------------------------------
+// --------------------------------------------------------------------
+// FORCE GLOBAL SYNC: (A+C) vs (B+D)
+// --------------------------------------------------------------------
 static void update_hw_duties(uint8_t *duties)
 {
     uint8_t i;
@@ -491,54 +494,55 @@ static void update_hw_duties(uint8_t *duties)
     app_status_t st;
     channel_ctl_t *ctl = heat_channels;
 
-    // --- 1. MASTER CLOCK (20s Switch) ---
+    // --- 1. GET TARGET POWER (Global) ---
+    // Problem: App might send [0, 100, 0, 100].
+    // Fix: Find the maximum value and apply it to EVERYONE.
+    uint8_t target_power = 0;
+    for(i = 0; i < MAX_HEATERS; i++) {
+        if (duties[i] != INVALID_DUTY_CYCLE && duties[i] > target_power) {
+            target_power = duties[i];
+        }
+    }
+
+    // --- 2. MASTER CLOCK (20s Switch) ---
     TickType_t now = xTaskGetTickCount();
-    // Use 32-bit math to prevent overflow
-    uint32_t period_ticks = pdMS_TO_TICKS(40000); 
-    uint32_t half_period  = pdMS_TO_TICKS(20000); 
+    uint32_t period_ticks = pdMS_TO_TICKS(50000); 
+    uint32_t half_period  = pdMS_TO_TICKS(25000); 
     
     uint32_t phase = (uint32_t)now % period_ticks;
     bool group_AC_active = (phase < half_period); 
 
     for(i = 0, ch = HEATER_A; i < MAX_HEATERS; i++, ch++, ctl++)
     {
-        // Skip if channel is strictly disabled in config
-        if(!hw_is_channel_enabled(ch)) continue;
-        
-        // --- 2. GET USER SETTING ---
-        // If the App sends '0', we must respect it (Heater Off)
-        // If the App sends 38, 57, or 100, we use that.
-        uint8_t requested_power = 0;
-        
-        if (duties[i] != INVALID_DUTY_CYCLE) {
-            requested_power = duties[i];
-        }
+        // --- 3. BYPASS "IS ENABLED" CHECK ---
+        // OLD CODE: if(!hw_is_channel_enabled(ch)) continue;
+        // NEW CODE: We run regardless (unless channel ID is totally invalid)
+        if (ch >= MAX_HEATERS) continue;
 
         uint8_t final_power = 0;
 
-        // --- 3. APPLY GROUP LOGIC ---
+        // --- 4. APPLY GROUP LOGIC ---
         if (ch == HEATER_A || ch == HEATER_C)
         {
-            if (group_AC_active) final_power = requested_power;
+            if (group_AC_active) final_power = target_power;
             else final_power = 0; 
         }
         else if (ch == HEATER_B || ch == HEATER_D)
         {
-            if (!group_AC_active) final_power = requested_power;
+            if (!group_AC_active) final_power = target_power;
             else final_power = 0; 
         }
         else 
         {
-            final_power = requested_power;
+            final_power = target_power;
         }
 
-        // --- 4. FORCE EXECUTION ---
-        // We now send the command blindly to ensure the hardware obeys.
+        // --- 5. FORCE EXECUTION ---
         st = hw_set_dutycycle(ch, final_power);
         
-        // Error logging to catch hardware failures
-        if(st != APPST_SUCCESS) {
-            _warn("Failed to set CH %d to %d%% (Err: %d)", ch, final_power, st);
+        // Debug output to see if it's trying
+        if (final_power > 0 && st != APPST_SUCCESS) {
+             _warn("Force Set CH %d Fail: %d", ch, st);
         }
     }
 }
@@ -554,21 +558,21 @@ static void tsk_heat_control(void *params)
 
     while(1)
     {
-        triggered = os_evt_wait(events, pdMS_TO_TICKS(3000));
+        triggered = os_evt_wait(events, pdMS_TO_TICKS(2500));
         os_evt_clear(events);
         read_hardware_channels();
         //check if temperatures are safe
         if(!is_temperature_safe())
         {
             os_evt_trigger(EVT_HARDWARE_FAIL);
-            run_safe_guard_time(pdMS_TO_TICKS(60000));
+            run_safe_guard_time(pdMS_TO_TICKS(50000));
             continue;
         }
         //check short status
         if(EVT_HEAT_SHORT & triggered)
         {
             os_evt_trigger(EVT_HARDWARE_FAIL);
-            run_safe_guard_time(pdMS_TO_TICKS(7000));
+            run_safe_guard_time(pdMS_TO_TICKS(6000));
             continue;
         }
 
