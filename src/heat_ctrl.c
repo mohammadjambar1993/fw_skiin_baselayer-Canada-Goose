@@ -772,15 +772,31 @@ static void update_duties_config(uint8_t *duties)
 // -------------------------------------------------------------
 // MODIFIED FUNCTION: Bypass Sequence / Force Direct Output
 // -------------------------------------------------------------
+// --------------------------------------------------------------------
+// FORCE DIRECT OUTPUT (Bypasses the "Breathing/Pulsing" logic)
+// --------------------------------------------------------------------
+// --------------------------------------------------------------------
+// FIXED FUNCTION: Applies Duty Cycle Directly to All Channels
+// --------------------------------------------------------------------
 static void update_hw_duties(uint8_t *duties)
 {
-    // ... loop variables ...
-    // Force direct value:
-    uint8_t target_val = duties[i]; 
-    if(ctl->measures.dutycycle != target_val) {
-        hw_set_dutycycle(ch, target_val);
+    uint8_t i;
+    heater_id_t ch;
+    channel_ctl_t *ctl = heat_channels;
+
+    for(i = 0, ch = HEATER_A; i < MAX_HEATERS; i++, ch++, ctl++)
+    {
+        if(!hw_is_channel_enabled(ch)) continue;
+        if (duties[i] == INVALID_DUTY_CYCLE) continue;
+
+        // FORCE DIRECT OUTPUT (No internal timers)
+        uint8_t target_val = duties[i]; 
+
+        if(ctl->measures.dutycycle != target_val)
+        {
+            hw_set_dutycycle(ch, target_val);
+        }
     }
-    // ...
 }
 
 
