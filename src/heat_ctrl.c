@@ -1,7 +1,11 @@
 /*
  * heat_ctrl.c
  *
- * Modified for: Bluetooth Control with 20s Toggle (A+C / B+D)
+ * MODIFIED VERSION: 
+ * - Toggles A+C / B+D every 20 seconds.
+ * - Supports Low/Med/High from App.
+ * - Forces Hardware Updates (Fixes A+C bug).
+ * - Includes BLE Safety Disconnect.
  */
 
 #include <string.h>
@@ -11,7 +15,7 @@
 #include "mya_util.h"
 #include "algos/autotempctl.h"
 #include "semphr.h"
-#include "ble_rpc.h" // Added for connection check
+#include "ble_rpc.h" // Added for Connection Safety
 
 #define ENABLE_LOGGER_HEATCTRL
 #ifdef ENABLE_LOGGER_HEATCTRL
@@ -36,9 +40,10 @@
 #endif
 
 // --- POWER LEVEL DEFINITIONS ---
+// Ensure High is 100 for MAX Power
 #define DUTY_LOW    38
 #define DUTY_MED    57
-#define DUTY_HIGH   100  // Max Power
+#define DUTY_HIGH   100  
 
 #define MAX_TEMPERATURE_SETPOINT    45
 #define MAX_PCB_TEMPERATURE         6000 //60C
@@ -101,6 +106,7 @@ static bool hardware_fail = false;
 static bool enable_printing = false;
 static SemaphoreHandle_t mtx_heat_chdata = NULL;
 
+/* Timer for session timeout*/
 static TimerHandle_t timer_heat_session = NULL;
 static inline void create_heat_session_timer(void);
 static void irq_timer_heat_session(TimerHandle_t xtimer);
@@ -108,7 +114,7 @@ static void irq_timer_heat_session(TimerHandle_t xtimer);
 static uint16_t session_time_remaining_counter = 0;
 static bool session_running = 0;
 
-// NEW: Timeout counter for BLE disconnection (Safety)
+// NEW: BLE Safety Counter
 static uint8_t ble_disconnection_time_remaining_counter = 0xFF;
 
 static void tsk_heat_control(void *params);
@@ -129,7 +135,7 @@ static channel_ctl_t *get_channel(heater_id_t ch);
 static void reset_last_heat_params(void);
 static bool is_session_active(void);
 static void session_reset(void);
-static void ble_disconnection_time_set(void);
+static void ble_disconnection_time_set(void); // NEW
 
 app_status_t heat_init(void)
 {
@@ -280,6 +286,7 @@ app_status_t heat_set_channels(cmd_heat_params_t *params)
     if(!is_valid_heat_params(params, false))
         return APPST_INVALID_PARAM;
     autoctl = false; //disable automatic control
+    //store last command in case safety guard time is activated
     memcpy(&last_heat_params_temp, params, sizeof(cmd_heat_params_t));
     os_evt_trigger(EVT_HEAT_NEW_SESSION);
 
@@ -299,16 +306,19 @@ app_status_t heat_set_temperature_sp(cmd_heat_params_t *params)
         _warn("Cannot acquire heat_ctl mutex");
         return APPST_ERROR;
     }
+    //read temperature set point for each channel
     for(uint8_t i = 0; i < MAX_HEATERS; i++, ch++)
     {
         ch->temperature_setpoint = params->data[i];
+        //reset all duty cycles that could be set previously by manual commands
         if(!autoctl)
         {
             hw_set_dutycycle(ch->measures.channel, 0);
         }
     }
     os_release_mutx(&mtx_heat_chdata);
-    autoctl = true; 
+    autoctl = true; //enable automatic control
+    //store last command in case safety guard time is activated
     memcpy(&last_heat_params_temp, params, sizeof(cmd_heat_params_t));
     os_evt_trigger(EVT_HEAT_NEW_SESSION);
 
@@ -351,6 +361,7 @@ static bool is_temperature_safe(void)
         _warn("Cannot acquire heat_ctl mutex");
         return false;
     }
+    //check if garment temperature is inside bounds
     for(uint8_t i = 0; i < MAX_HEATERS; i++, ch++)
     {
         if(!ch->ctl_settings.enabled)
@@ -363,6 +374,7 @@ static bool is_temperature_safe(void)
         }
     }
     os_release_mutx(&mtx_heat_chdata);
+    //check PCB temperature
     st = hw_get_pcb_temperature(&pcbtemp);
     if(APPST_SUCCESS != st)
     {
@@ -387,6 +399,7 @@ static void run_automatic_temperature_control(void)
         _warn("Cannot acquire heat_ctl mutex");
         return;
     }
+    //run the algorithm
     status = tctl_run(heat_channels);
     if(APPST_SUCCESS != status)
     {
@@ -394,6 +407,7 @@ static void run_automatic_temperature_control(void)
         return;
     }
     os_release_mutx(&mtx_heat_chdata);
+    //get the parameters and update the outputs
     status = tctl_get_result(&params);
     if(APPST_SUCCESS != status)
     {
@@ -467,8 +481,8 @@ static void update_hw_voltage(uint8_t newvoltage)
 }
 
 // --------------------------------------------------------------------
-// SMART TOGGLE: A+C (20s) <--> B+D (20s)
-// Controlled by App Level (Low/Med/High)
+// ROBUST SYNC: (A+C) vs (B+D)
+// FORCE UPDATES: Ensures commands are always sent
 // --------------------------------------------------------------------
 static void update_hw_duties(uint8_t *duties)
 {
@@ -477,49 +491,54 @@ static void update_hw_duties(uint8_t *duties)
     app_status_t st;
     channel_ctl_t *ctl = heat_channels;
 
-    // --- TIMING LOGIC (20s Toggle) ---
-    // Total Cycle = 40 Seconds. 0-20s = A+C, 20-40s = B+D
+    // --- 1. MASTER CLOCK (20s Switch) ---
     TickType_t now = xTaskGetTickCount();
-    TickType_t period_ticks = pdMS_TO_TICKS(40000); 
-    TickType_t half_period  = pdMS_TO_TICKS(20000); 
+    // Use 32-bit math to prevent overflow
+    uint32_t period_ticks = pdMS_TO_TICKS(40000); 
+    uint32_t half_period  = pdMS_TO_TICKS(20000); 
     
-    TickType_t phase = now % period_ticks;
+    uint32_t phase = (uint32_t)now % period_ticks;
     bool group_AC_active = (phase < half_period); 
 
     for(i = 0, ch = HEATER_A; i < MAX_HEATERS; i++, ch++, ctl++)
     {
-        // Check if channel exists and is enabled
+        // Skip if channel is strictly disabled in config
         if(!hw_is_channel_enabled(ch)) continue;
-        if (duties[i] == INVALID_DUTY_CYCLE) continue;
+        
+        // --- 2. GET USER SETTING ---
+        // If the App sends '0', we must respect it (Heater Off)
+        // If the App sends 38, 57, or 100, we use that.
+        uint8_t requested_power = 0;
+        
+        if (duties[i] != INVALID_DUTY_CYCLE) {
+            requested_power = duties[i];
+        }
 
-        // 1. Get the Requested Power (Low, Med, High)
-        uint8_t requested_power = duties[i];
         uint8_t final_power = 0;
 
-        // 2. Apply Toggle Logic
+        // --- 3. APPLY GROUP LOGIC ---
         if (ch == HEATER_A || ch == HEATER_C)
         {
             if (group_AC_active) final_power = requested_power;
-            else final_power = 0;
+            else final_power = 0; 
         }
         else if (ch == HEATER_B || ch == HEATER_D)
         {
             if (!group_AC_active) final_power = requested_power;
-            else final_power = 0;
+            else final_power = 0; 
         }
-        else
+        else 
         {
             final_power = requested_power;
         }
 
-        // 3. Send to Hardware
-        if(ctl->measures.dutycycle != final_power)
-        {
-            st = hw_set_dutycycle(ch, final_power);
-            if(APPST_SUCCESS != st)
-            {
-                 _warn("failed to set ch %d, duty %d: %d", ch, final_power, st);
-            }
+        // --- 4. FORCE EXECUTION ---
+        // We now send the command blindly to ensure the hardware obeys.
+        st = hw_set_dutycycle(ch, final_power);
+        
+        // Error logging to catch hardware failures
+        if(st != APPST_SUCCESS) {
+            _warn("Failed to set CH %d to %d%% (Err: %d)", ch, final_power, st);
         }
     }
 }
@@ -538,13 +557,14 @@ static void tsk_heat_control(void *params)
         triggered = os_evt_wait(events, pdMS_TO_TICKS(3000));
         os_evt_clear(events);
         read_hardware_channels();
-        
+        //check if temperatures are safe
         if(!is_temperature_safe())
         {
             os_evt_trigger(EVT_HARDWARE_FAIL);
             run_safe_guard_time(pdMS_TO_TICKS(60000));
             continue;
         }
+        //check short status
         if(EVT_HEAT_SHORT & triggered)
         {
             os_evt_trigger(EVT_HARDWARE_FAIL);
@@ -610,6 +630,7 @@ static void tsk_heat_control(void *params)
 
         if(EVT_HEAT_SAMPLE & triggered)
         {
+            //period and voltage were set by external commands
             if(autoctl) //automatic control
             {
                 run_automatic_temperature_control();
@@ -666,6 +687,7 @@ uint16_t heat_get_remaining_session_time(void)
     return session_time_remaining_counter;
 }
 
+// Added for Safety
 uint16_t heat_get_remaining_ble_disconnection_time(void)
 {
     return ble_disconnection_time_remaining_counter;
@@ -673,15 +695,20 @@ uint16_t heat_get_remaining_ble_disconnection_time(void)
 
 static void ble_disconnection_time_set(void)
 {
-    //Timeout default: 60 seconds
+    //Timeout default: 60 seconds after phone disconnects
     ble_disconnection_time_remaining_counter = 60;
 }
 
+
+/* this function is experimental and was implemented to stop the control logic
+ * and heater module when writing new configuration into ADS. It is assumed that
+ * after the ADS is re-configured, the pod will reset itself */
 void heat_stop_control(void)
 {
     hw_stop();
 }
 
+//following functions are used only for debugging
 void heat_cycle_printing(void)
 {
     enable_printing = !enable_printing;
@@ -698,6 +725,7 @@ static void print_channels_parameters(void)
 
     channel_ctl_t *channel = heat_channels;
 
+    //print header
     _print("\r\n\r\n");
     _print("CH\t[V]\t[mA]\t[R]\t[C]\t[Duty]\t[St]");
     for(uint8_t i = 0; i < MAX_HEATERS; i++, channel++)
