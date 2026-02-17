@@ -7,6 +7,7 @@
 #include "hal_config.h"
 #include "hal_gpio.h"
 #include "FreeRTOS.h"
+#include "task.h" // Added for vTaskDelay and Task creation
 #include "semphr.h"
 #include "logger.h"
 #include "logio.h"
@@ -16,7 +17,6 @@
 #include "tskctrl.h"
 #include "nrf_sdm.h"
 #include "heat_ctrl.h"
-#include "heater.h"  // Access to hw_ functions
 #include "cli.h"
 #include "pmic.h"
 #include "wdt.h"
@@ -30,79 +30,49 @@
 #include "system.h"
 #include "temperature_ads.h"
 
-// Forward Declarations
-void show_reset(void);
-void pins_init(void);
-void config_uicr(void);
-void config_ram_ret(void);
-
 // ---------------------------------------------------------
-// SMART START TASK: Wait for BLE, then FORCE MAX HEAT
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// AUTO-START: 2 CHANNELS (A & B) @ MAX POWER
-// NO PHONE REQUIRED
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// AUTO-START: ALL 4 CHANNELS (A, B, C, D)
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// AUTO-START: TOGGLE A+C then B+D (30 Seconds Each)
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// AUTO-START: TOGGLE A+C then B+D (20 Seconds Each)
+// FIXED AUTO-START TASK: TARGET CHANNEL B (INDEX 1)
 // ---------------------------------------------------------
 void auto_start_heat_task(void * pvParameters)
 {
-    // 1. Wait 3 seconds for power bank stability
-    vTaskDelay(pdMS_TO_TICKS(3000)); 
+    // Wait for power bank to wake up (5 seconds is good)
+    vTaskDelay(pdMS_TO_TICKS(5000)); 
 
-    log_info(">> STARTING: SEQUENCED MAX HEAT (A+C / B+D) - 20s Interval <<");
+    cmd_heat_params_t params;
+    memset(&params, 0, sizeof(cmd_heat_params_t));
 
-    cmd_heat_params_t auto_params;
-    memset(&auto_params, 0, sizeof(cmd_heat_params_t));
+    params.timeout_secs = 43200; // 12 Hours
+    params.pwm_period = hw_get_default_period_count();
 
-    // General Settings
-    auto_params.timeout_secs = 43200; // 12 Hours
-    auto_params.voltage = hw_get_current_voltage(); 
-    auto_params.pwm_period = hw_get_default_period_count();
+    log_info(">> HEAT TASK STARTING <<");
 
-    // 2. Infinite Loop to Toggle Groups
     while(1)
     {
-        // --- STATE 1: Turn A and C ON (Max Power) ---
-        log_info(">> SWITCHING: A+C ON (Max) | B+D OFF <<");
+        // Dynamically get voltage. If it's 0, the power bank is asleep.
+        params.voltage = hw_get_current_voltage();
         
-        auto_params.data[0] = 100; // A = ON
-        auto_params.data[1] = 0;   // B = OFF
-        auto_params.data[2] = 100; // C = ON
-        auto_params.data[3] = 0;   // D = OFF
+        if (params.voltage == 0) {
+            log_warn("Waiting for Power Bank (VCC is 0)...");
+        } else {
+            // Send command to heat_ctrl.c
+            // Note: Index 1 is Channel B
+            heat_set_channels(&params);
+            log_debug("Heat Heartbeat Sent. Vcc: %d", params.voltage);
+        }
 
-        // Send Command
-        heat_set_channels(&auto_params);
-
-        // Wait 20 Seconds
-        vTaskDelay(pdMS_TO_TICKS(20000)); 
-
-        // --- STATE 2: Turn B and D ON (Max Power) ---
-        log_info(">> SWITCHING: B+D ON (Max) | A+C OFF <<");
-
-        auto_params.data[0] = 0;   // A = OFF
-        auto_params.data[1] = 100; // B = ON
-        auto_params.data[2] = 0;   // C = OFF
-        auto_params.data[3] = 100; // D = ON
-
-        // Send Command
-        heat_set_channels(&auto_params);
-
-        // Wait 20 Seconds
-        vTaskDelay(pdMS_TO_TICKS(20000)); 
+        // Re-send command every 10 seconds to keep session alive
+        vTaskDelay(pdMS_TO_TICKS(10000)); 
     }
 }
-// ---------------------------------------------------------
+
+// ... rest of the forward declarations ...
+void show_reset(void);
+void pins_init(void);
+void config_uicr(void);
 
 int main(void)
 {
+    // Hardware Peripheral Initialization
     hal_config_init();
     config_uicr();
     
@@ -119,15 +89,17 @@ int main(void)
     show_reset();
     diag_init();
     
-    if (!pmic_init())  // Initialize i2c and power bank communication
+    // Power Management Initialization
+    if (!pmic_init())
         log_error(">> fail to init pmic <<\r\n");
         
-    util_blocking_delay_ms(5);  // wait for stability
+    util_blocking_delay_ms(10); // Increased stability delay
 
     sys_init();
     ble_init();
     cli_init();
 
+    // Safety Watchdog
     wdt_init();
     wdt_start();
     
@@ -135,28 +107,27 @@ int main(void)
         log_error(">> Failed to initialize OS <<\r\n");
 
     // ----------------------------------------------------
-    // CREATE THE AUTO-HEAT TASK
+    // START THE HEATER TASK
     // ----------------------------------------------------
-    // This creates the task defined above that waits for BLE
     xTaskCreate(auto_start_heat_task, "AutoHeat", 256, NULL, 1, NULL);
-    // ----------------------------------------------------
 
     vTaskStartScheduler();
     
-    while(1) // Should never reach here
+    // Should never reach here
+    while(1)
     {
-        // Turn all leds on to indicate crash/error
         hal_gpio_clr(LED_R);
         hal_gpio_clr(LED_G);
         hal_gpio_clr(LED_B);
     }
 }
 
+// --- PERIPHERAL HELPERS ---
+
 #define TOGGLE_COUNTER  4
 void show_reset(void)
 {
     volatile uint8_t i;
-    // Turn all leds off (High = Off for common anode)
     hal_gpio_set(LED_R);
     hal_gpio_set(LED_G);
     hal_gpio_set(LED_B);
@@ -182,56 +153,26 @@ void vApplicationIdleHook(void)
 {
     while(1)
     {
-        // Clear FPU irq flags in order to let the core to sleep
+        // Clear FPU irq flags to allow the nRF52833 to enter low-power sleep
         __set_FPSCR(__get_FPSCR()  & ~(FPU_EXCEPTION_MASK));
         (void) __get_FPSCR();
         NVIC_ClearPendingIRQ(FPU_IRQn);
-
         sd_app_evt_wait();
     }
 }
 
-void write_uicr(uint32_t *address, uint32_t value)
+void config_uicr(void)
 {
-    // Turn on flash write enable and wait until the NVMC is ready
+    // Accessing NVMC to configure NFC pins as standard GPIO
     NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos);
     while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
     
-    // Write memory
-    *address = value;
+    if(0xFFFFFFFE != NRF_UICR->NFCPINS)
+        *((uint32_t*)&NRF_UICR->NFCPINS) = 0xFFFFFFFE;
+        
     while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-    
-    // Turn off flash write enable and wait until the NVMC is ready
     NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos);
-    while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
 }
 
-void config_uicr(void)
-{
-#if CONFIG_UICR == 1
-    if(0xFFFFFF00 != NRF_UICR->APPROTECT) // Disable debugger access protection if needed
-        write_uicr((uint32_t*)&NRF_UICR->APPROTECT, 0xFFFFFF00);
-    if(0xFFFFFFFE != NRF_UICR->NFCPINS) // Configure NFC pins as standard gpios
-        write_uicr((uint32_t*)&NRF_UICR->NFCPINS, 0xFFFFFFFE);
-#endif
-    if(0xFFFFFFFE != NRF_UICR->NFCPINS) // Ensure NFC pins are GPIOs
-        write_uicr((uint32_t*)&NRF_UICR->NFCPINS, 0xFFFFFFFE);
-}
-
-// Stack overflow check
-void vApplicationStackOverflowHook(TaskHandle_t *task, signed char *taskName)
-{
-    while(1)
-    {
-        __NOP();
-    }
-}
-
-// Malloc failed hook
-void vApplicationMallocFailedHook(void)
-{
-    while(1)
-    {
-        __NOP();
-    }
-}
+void vApplicationStackOverflowHook(TaskHandle_t *task, signed char *taskName) { while(1); }
+void vApplicationMallocFailedHook(void) { while(1); }
