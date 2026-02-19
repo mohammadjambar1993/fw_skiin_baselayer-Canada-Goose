@@ -1,88 +1,112 @@
+#include <string.h>
+#include "heat_ctrl.h"
 #include "heater.h"
-#include "heat_ctrl.h" 
-#include "hal_gpio.h"
-#include "nrf_gpio.h"
+#include "logger.h"
+#include "mya_util.h"
+#include "algos/autotempctl.h"
+#include "semphr.h"
+#include "ble_rpc.h"
 
-// --- DEFINE PARAMS SO COMPILER IS HAPPY ---
-typedef struct {
-    uint8_t channel;
-    int32_t volts;       
-    int32_t current;     
-    int32_t resistance;  
-    int32_t temperature; 
-    uint8_t dutycycle;   
-    uint8_t status;
-} heat_params_t;
+#define MAX_HEATERS 5
+#define MTX_CH_DATA_TOUT 5
 
-// --- HARDWARE STATE ---
-static heat_ch_config_t const * p_config = NULL;
-static uint8_t num_channels = 0;
-static uint32_t pwm_period = 1000; 
-static uint8_t current_voltage = 15; 
+#if PCB_ID == PCB_MULTI_CHANNEL
+static const heat_ch_config_t channels_config[] = {
+    { .id = 0, .heater_output = HEATING_CHA, .addr_ina231 = 0x40, .analog_mux_addr = 0 },
+    { .id = 1, .heater_output = HEATING_CHB, .addr_ina231 = 0x41, .analog_mux_addr = 2 },
+    { .id = 2, .heater_output = HEATING_CHC, .addr_ina231 = 0x44, .analog_mux_addr = 1 },
+    { .id = 3, .heater_output = HEATING_CHD, .addr_ina231 = 0x45, .analog_mux_addr = 3 },
+    { .id = 4, .heater_output = HEATING_CHE, .addr_ina231 = 0x42, .analog_mux_addr = 0 },
+};
+#else
+static const heat_ch_config_t channels_config[] = {
+    { .id = 0, .heater_output = HEATING_CHA, .addr_ina231 = 0x40, .analog_mux_addr = 0 },
+};
+#endif
 
-// --- DRIVER FUNCTIONS ---
-app_status_t hw_init(const heat_ch_config_t * config, uint8_t count)
+static channel_ctl_t heat_channels[MAX_HEATERS] = {0};
+static cmd_heat_params_t last_heat_params;
+static bool autoctl = false;
+static SemaphoreHandle_t mtx_heat_chdata = NULL;
+static TimerHandle_t timer_heat_session = NULL;
+static uint16_t session_time_remaining = 0;
+static bool session_running = false;
+
+static void tsk_heat_control(void *params);
+static void irq_timer_heat_session(TimerHandle_t xtimer);
+static void get_auto_ctl_settings(void);
+
+app_status_t heat_init(void)
 {
-    p_config = config;
-    num_channels = count;
+    uint8_t num = sizeof(channels_config)/sizeof(channels_config[0]);
+    hw_init(channels_config, num); 
+    
+    memset(heat_channels, 0, sizeof(heat_channels));
+    get_auto_ctl_settings();
+    os_create_mutex(&mtx_heat_chdata);
+    tctl_init(); 
+    
+    xTaskCreate(tsk_heat_control, "HeatCtrl", 512, NULL, 3, NULL);
+    return APPST_SUCCESS;
+}
 
-    // CRITICAL: Configure pins as OUTPUTS so electricity can flow
-    for(uint8_t i = 0; i < num_channels; i++)
+static void get_auto_ctl_settings(void) {
+    for(uint8_t i = 0; i < MAX_HEATERS; i++) band_get_ctl_settings(i, &heat_channels[i].ctl_settings);
+}
+
+// Duty Cycle Mode (Used by main.c)
+app_status_t heat_set_channels(cmd_heat_params_t *params)
+{
+    memcpy(&last_heat_params, params, sizeof(cmd_heat_params_t));
+    autoctl = false; 
+    session_time_remaining = params->timeout_secs;
+    session_running = true;
+    if(timer_heat_session) xTimerStart(timer_heat_session, 0);
+    os_evt_trigger(EVT_HEAT_NEW_SESSION);
+    return APPST_SUCCESS;
+}
+
+// Temperature Mode (Not used right now, but needed for linker)
+app_status_t heat_set_temperature_sp(cmd_heat_params_t *params)
+{
+    memcpy(&last_heat_params, params, sizeof(cmd_heat_params_t));
+    autoctl = true; 
+    session_time_remaining = params->timeout_secs;
+    session_running = true;
+    if(timer_heat_session) xTimerStart(timer_heat_session, 0);
+    os_evt_trigger(EVT_HEAT_NEW_SESSION);
+    return APPST_SUCCESS;
+}
+
+static void tsk_heat_control(void *params)
+{
+    timer_heat_session = xTimerCreate("tm", pdMS_TO_TICKS(1000), pdTRUE, 0, irq_timer_heat_session);
+    
+    while(1)
     {
-        if(p_config[i].heater_output != 0xFFFFFFFF)
+        // Wait for next command from main.c
+        os_evt_wait(EVT_HEAT_NEW_SESSION | EVT_HEAT_SESSION_TIMEOUT | EVT_HEAT_SAMPLE, pdMS_TO_TICKS(1000));
+        
+        // Apply Duty Cycles continuously
+        if(!autoctl) 
         {
-            nrf_gpio_cfg_output(p_config[i].heater_output);
-            nrf_gpio_pin_clear(p_config[i].heater_output); // Start OFF
+            for(int i=0; i<MAX_HEATERS; i++) {
+                hw_set_dutycycle(i, last_heat_params.data[i]);
+            }
         }
     }
-    return APPST_SUCCESS;
 }
 
-app_status_t hw_set_dutycycle(uint8_t channel, uint8_t duty)
-{
-    if (p_config == NULL || channel >= num_channels) return APPST_INVALID_PARAM;
-
-    uint32_t pin = p_config[channel].heater_output;
-
-    // Execute the ON/OFF command from your heat_ctrl.c
-    if (duty > 0)
-    {
-        nrf_gpio_pin_set(pin);   // Turn ON
-    }
-    else
-    {
-        nrf_gpio_pin_clear(pin); // Turn OFF
-    }
-
-    return APPST_SUCCESS;
+static void irq_timer_heat_session(TimerHandle_t xtimer) {
+    if(session_running && session_time_remaining > 0) session_time_remaining--;
+    os_evt_trigger(EVT_HEAT_SESSION_TIMEOUT);
 }
 
-// --- SUPPORT FUNCTIONS ---
-app_status_t hw_set_duty_period(uint16_t period, bool reset) { pwm_period = period; return APPST_SUCCESS; }
-uint32_t hw_get_duty_period_count(void) { return pwm_period; }
-uint32_t hw_get_default_period_count(void) { return 1000; }
-uint8_t hw_get_current_voltage(void) { return 15; } 
-app_status_t hw_set_voltage(uint8_t voltage) { current_voltage = voltage; return APPST_SUCCESS; }
-app_status_t hw_set_lowest_vcc(void) { return APPST_SUCCESS; }
-uint8_t hw_get_lowest_voltage(void) { return 5; }
-uint8_t hw_get_highest_voltage(void) { return 20; }
-
-app_status_t hw_get_params(heater_id_t ch, heat_params_t * params)
-{
-    if (!params) return APPST_INVALID_PARAM;
-    params->channel = (uint8_t)ch;
-    params->volts = 15000; 
-    params->current = 680; // 15V / 22 Ohms
-    params->temperature = 3000; // 30C
-    return APPST_SUCCESS;
-}
-
-app_status_t hw_get_pcb_temperature(uint16_t * temp) { *temp = 3000; return APPST_SUCCESS; }
-bool hw_is_channel_enabled(uint8_t channel) { return true; }
-void hw_stop(void) { 
-    if(p_config) {
-        for(uint8_t i=0; i<num_channels; i++) nrf_gpio_pin_clear(p_config[i].heater_output);
-    }
-}
-bool hw_is_task_stopped(void) { return false; }
-uint32_t hw_get_ch_ontime_count(uint8_t channel) { return 0; }
+// System Stubs
+bool heat_get_channel_params(heater_id_t ch, channel_ctl_t *params) { return true; }
+bool heat_is_channel_overheating(heater_id_t ch) { return false; }
+bool heat_is_hardware_failed(void) { return false; }
+uint16_t heat_get_remaining_session_time(void) { return session_time_remaining; }
+uint16_t heat_get_remaining_ble_disconnection_time(void) { return 0xFFFF; }
+void heat_stop_control(void) { hw_stop(); }
+void heat_cycle_printing(void) {}
