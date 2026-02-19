@@ -1,119 +1,109 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-
 #include "appconfig.h"
 #include "hal_config.h"
 #include "hal_gpio.h"
 #include "FreeRTOS.h"
+#include "task.h"
 #include "logger.h"
 #include "logio.h"
-#include "mya_util.h"
+#include "nrf_soc.h"
 #include "heat_ctrl.h"
 #include "pmic.h"
-#include "wdt.h"
 #include "gtk_spi.h"
 #include "system.h"
-#include "nrf_sdm.h"
+#include "temperature_ads.h"
 
-/* FORWARD DECLARATIONS */
-static void show_reset(void);
-static void pins_init(void);
-static void config_uicr(void);
-static void start_brute_force_heating(void);
+// ---------------------------------------------------------
+// AUTO-START TASK: 2-BY-2 ALTERNATING AT 90% POWER
+// ---------------------------------------------------------
+void auto_start_task(void * pvParameters)
+{
+    // Wait 5 seconds for power bank to fully wake up
+    vTaskDelay(pdMS_TO_TICKS(5000)); 
+
+    cmd_heat_params_t prm;
+    memset(&prm, 0, sizeof(cmd_heat_params_t));
+
+    prm.timeout_secs = 43200; // Run for 12 Hours
+    prm.pwm_period = 1000;
+    prm.voltage = 15; // Set to your input voltage
+
+    while(1)
+    {
+        // --- PHASE 1: A and C at 90% (B and D OFF) ---
+        prm.data[0] = 90; // A: 90%
+        prm.data[1] = 0;  // B: OFF
+        prm.data[2] = 90; // C: 90%
+        prm.data[3] = 0;  // D: OFF
+        prm.data[4] = 0;  // E: OFF
+
+        heat_set_channels(&prm);
+        
+        // Wait 20 seconds before switching
+        vTaskDelay(pdMS_TO_TICKS(20000)); 
+
+
+        // --- PHASE 2: B and D at 90% (A and C OFF) ---
+        prm.data[0] = 0;  // A: OFF
+        prm.data[1] = 90; // B: 90%
+        prm.data[2] = 0;  // C: OFF
+        prm.data[3] = 90; // D: 90%
+        prm.data[4] = 0;  // E: OFF
+
+        heat_set_channels(&prm);
+        
+        // Wait 20 seconds before switching back
+        vTaskDelay(pdMS_TO_TICKS(20000)); 
+    }
+}
+
+// ... Boilerplate Initialization ...
+void show_reset(void);
+void pins_init(void);
+void config_uicr(void);
 
 int main(void)
 {
-    hal_config_init();
-    config_uicr();
+    hal_config_init(); config_uicr();
+    if(IOST_MAP_OK != hal_gpio_init()) while(1);
+    pins_init(); log_init(LEVEL_DEBUG, LOG_SEGGER_RTT); logio_init(); 
+    gtk_spi_init(); diag_init(); pmic_init();
+    sys_init(); ble_init(); cli_init(); wdt_init(); wdt_start();
+    if(!os_init()) log_error(">> Failed to initialize OS <<\r\n");
 
-    if(IOST_MAP_OK != hal_gpio_init())
-        log_error(">> IO MAP ERROR <<\r\n");
+    // Init Heater Module
+    heat_init();
 
-    pins_init();
-    log_init(LEVEL_DEBUG, LOG_SEGGER_RTT);
-    logio_init();
-
-    if(!gtk_spi_init()) log_error(">> fail SPI <<\r\n");
-
-    show_reset();
-    diag_init();
-    pmic_init();
-    util_blocking_delay_ms(5);
-    sys_init();
-
-    /* NO BLE INIT */
-    // ble_init(); 
-
-    cli_init();
-    wdt_init();
-    wdt_start();
-
-    if(!os_init()) log_error(">> Failed OS <<\r\n");
-
-    /* HEAT CONTROLLER INIT */
-    if(APPST_SUCCESS != heat_init())
-        log_error(">> Failed heat init <<\r\n");
-
-    /* START IMMEDIATELY */
-    start_brute_force_heating();
+    // Start Task
+    xTaskCreate(auto_start_task, "Auto", 256, NULL, 1, NULL);
 
     vTaskStartScheduler();
-
-    while(1) { }
+    while(1) {
+        hal_gpio_clr(LED_R); hal_gpio_clr(LED_G); hal_gpio_clr(LED_B);
+    }
 }
 
-static void start_brute_force_heating(void)
-{
-    // The params don't matter because heat_ctrl.c is hardcoded 
-    // to Channel B / 45C / Max Power.
-    cmd_heat_params_t params = {0};
-    
-    // Just trigger the session
-    heat_set_channels(&params); 
-    
-    log_info(">>> BRUTE FORCE HEATING STARTED <<<");
-}
-
-/* ============================================================= */
-/* BOILERPLATE                              */
-/* ============================================================= */
-
-#define TOGGLE_COUNTER 4
-static void show_reset(void)
-{
+void show_reset(void) {
+    volatile uint8_t i;
     hal_gpio_set(LED_R); hal_gpio_set(LED_G); hal_gpio_set(LED_B);
-    for(uint8_t i = 0; i < TOGGLE_COUNTER; i++)
-    {
+    for(i = 0; i < 4; i++) {
         hal_gpio_toggle(LED_R); hal_gpio_toggle(LED_G); hal_gpio_toggle(LED_B);
         util_blocking_delay_ms(100);
     }
-    log_info(">> RESET <<");
 }
-
-static void pins_init(void)
-{
-    hal_gpio_set(CS_IMU);
-    hal_gpio_set(CS_MEM);
+void pins_init(void) { hal_gpio_set(CS_IMU); hal_gpio_set(CS_MEM); }
+void vApplicationIdleHook(void) { 
+    __set_FPSCR(__get_FPSCR() & ~(0x0000009F)); (void) __get_FPSCR(); 
+    NVIC_ClearPendingIRQ(FPU_IRQn); sd_app_evt_wait(); 
 }
-
-void vApplicationIdleHook(void)
-{
-    while(1) { sd_app_evt_wait(); }
-}
-
-static void config_uicr(void)
-{
-    if(0xFFFFFFFE != NRF_UICR->NFCPINS)
-    {
-        NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos);
-        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-        NRF_UICR->NFCPINS = 0xFFFFFFFE;
-        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-        NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos);
-        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
+void config_uicr(void) { 
+    if(0xFFFFFFFE != NRF_UICR->NFCPINS) {
+        NRF_NVMC->CONFIG = 1; while(NRF_NVMC->READY == 0);
+        *((uint32_t*)&NRF_UICR->NFCPINS) = 0xFFFFFFFE;
+        while(NRF_NVMC->READY == 0); NRF_NVMC->CONFIG = 0;
     }
 }
-
-void vApplicationStackOverflowHook(TaskHandle_t *task, signed char *taskName) { while(1); }
+void vApplicationStackOverflowHook(TaskHandle_t *t, signed char *n) { while(1); }
 void vApplicationMallocFailedHook(void) { while(1); }

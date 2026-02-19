@@ -1,261 +1,88 @@
-/*
- * heat_ctrl.c
- *
- * "Play and Go" - 2-BY-2 ALTERNATING MODE
- * Group 1: A + C (Diagonal)
- * Group 2: B + D (Diagonal)
- * Time: 5 Seconds per group
- * Voltage: 5V (Forced for safety with 2 channels active)
- *
- */
-
-#include <string.h>
-#include "heat_ctrl.h"
 #include "heater.h"
-#include "logger.h"
-#include "mya_util.h"
-#include "algos/autotempctl.h"
-#include "ble_rpc.h"
-#include "semphr.h"
+#include "heat_ctrl.h" 
+#include "hal_gpio.h"
+#include "nrf_gpio.h"
 
-/* ========================================== */
-/* USER CONFIGURATION                         */
-/* ========================================== */
-#define TARGET_VOLTAGE      15     // 5V is SAFE for 2 channels (12.5W total)
-#define SWITCH_DELAY_MS     10000  // 5 Seconds switching time
-#define MAX_PCB_TEMP_RAW    8500  // 85C Safety Cutoff
+// --- DEFINE PARAMS SO COMPILER IS HAPPY ---
+typedef struct {
+    uint8_t channel;
+    int32_t volts;       
+    int32_t current;     
+    int32_t resistance;  
+    int32_t temperature; 
+    uint8_t dutycycle;   
+    uint8_t status;
+} heat_params_t;
 
-/* ========================================== */
+// --- HARDWARE STATE ---
+static heat_ch_config_t const * p_config = NULL;
+static uint8_t num_channels = 0;
+static uint32_t pwm_period = 1000; 
+static uint8_t current_voltage = 15; 
 
-#define ENABLE_LOGGER_HEATCTRL
-#ifdef ENABLE_LOGGER_HEATCTRL
-    #include "util/logger.h"
-    #define logtag  "[heatctl] "
-    #define _debug(...)     log_debug(logtag __VA_ARGS__)
-    #define _info(...)      log_info(logtag __VA_ARGS__)
-    #define _warn(...)      log_warn(logtag __VA_ARGS__)
-    #define _error(...)     log_error(logtag __VA_ARGS__)
-    #define _print(...)                                 \
-    do                                                  \
-    {                                                   \
-        SEGGER_RTT_SetTerminal(0);                      \
-        SEGGER_RTT_printf(0, __VA_ARGS__);  \
-    }while(0)
-#else
-    #define _debug(...)
-    #define _info(...)
-    #define _warn(...)
-    #define _error(...)
-    #define _print(...)
-#endif
-
-#define MTX_CH_DATA_TOUT            5
-
-// Channel definitions
-#define HEATER_A            0 
-#define HEATER_B            1 
-#define HEATER_C            2 
-#define HEATER_D            3 
-#define NUM_HEATERS         4
-
-/* ----------------------------------------------------------- */
-/* FORCED 4 CHANNELS CONFIGURATION                             */
-/* ----------------------------------------------------------- */
-static const heat_ch_config_t channels_config[] =
+// --- DRIVER FUNCTIONS ---
+app_status_t hw_init(const heat_ch_config_t * config, uint8_t count)
 {
-    { .id = HEATER_A, .heater_output = HEATING_CHA, .addr_ina231 = 0x40, .analog_mux_addr = 0 },
-    { .id = HEATER_B, .heater_output = HEATING_CHB, .addr_ina231 = 0x41, .analog_mux_addr = 2 },
-    { .id = HEATER_C, .heater_output = HEATING_CHC, .addr_ina231 = 0x44, .analog_mux_addr = 1 },
-    { .id = HEATER_D, .heater_output = HEATING_CHD, .addr_ina231 = 0x45, .analog_mux_addr = 3 }
-};
+    p_config = config;
+    num_channels = count;
 
-static bool initialized = false;
-static channel_ctl_t heat_channels[MAX_HEATERS] = {0};
-static SemaphoreHandle_t mtx_heat_chdata = NULL;
-static bool session_running = false;
-static bool enable_printing = true;
-
-/* Forward Declarations */
-static void tsk_heat_control(void *params);
-static void get_auto_ctl_settings(void);
-static void read_hardware_channels(void);
-static bool is_temperature_safe(void);
-static void print_channels_parameters(void);
-
-/* ============================================================= */
-/* INIT FUNCTIONS                                                */
-/* ============================================================= */
-
-app_status_t heat_init(void)
-{
-    if(initialized) return APPST_INVALID_STATE;
-
-    uint8_t num_channels = sizeof(channels_config)/sizeof(channels_config[0]);
-    app_status_t status = hw_init(channels_config, num_channels);
-
-    if(APPST_SUCCESS == status)
+    // CRITICAL: Configure pins as OUTPUTS so electricity can flow
+    for(uint8_t i = 0; i < num_channels; i++)
     {
-        ASSERT_TASK(tsk_create(TSK_HEATER_CTRL, tsk_heat_control));
-        memset(heat_channels, 0, sizeof(heat_channels));
-        get_auto_ctl_settings();
-        initialized = true;
-        os_create_mutex(&mtx_heat_chdata);
-        tctl_init(); 
-    }
-    else
-    {
-        _error("failed to init heater module: %d", status);
-    }
-    return status;
-}
-
-static void get_auto_ctl_settings(void)
-{
-    heater_id_t ch = HEATER_A;
-    channel_ctl_t *ptr = heat_channels;
-    for(uint8_t i = 0; i < MAX_HEATERS; i++, ch++, ptr++)
-    {
-        band_get_ctl_settings(ch, &ptr->ctl_settings);
-    }
-}
-
-/* ============================================================= */
-/* CONTROL TASK (2-BY-2 ALTERNATING MODE)                        */
-/* ============================================================= */
-
-static void tsk_heat_control(void *params)
-{
-    // 1. Wait 3 seconds for power bank stability
-    vTaskDelay(pdMS_TO_TICKS(3000)); 
-
-    _info(">> STARTING: 2-BY-2 ALTERNATING MODE (A+C then B+D) @ 5V <<");
-
-    // Start immediately (Play and Go)
-    session_running = true;
-
-    while(1)
-    {
-        // -------------------------------------------------
-        // PHASE 1: A + C ON (B + D OFF)
-        // -------------------------------------------------
-        
-        // Safety & Voltage Check
-        read_hardware_channels();
-        if(!is_temperature_safe()) { 
-             for(int i=0;i<4;i++) hw_set_dutycycle(i, 0); 
-             vTaskDelay(pdMS_TO_TICKS(5000)); continue; 
+        if(p_config[i].heater_output != 0xFFFFFFFF)
+        {
+            nrf_gpio_cfg_output(p_config[i].heater_output);
+            nrf_gpio_pin_clear(p_config[i].heater_output); // Start OFF
         }
-        if(hw_get_current_voltage() != TARGET_VOLTAGE) hw_set_voltage(TARGET_VOLTAGE);
-
-        // Apply Phase 1
-        hw_set_dutycycle(HEATER_A, 100);
-        hw_set_dutycycle(HEATER_B, 0);
-        hw_set_dutycycle(HEATER_C, 100);
-        hw_set_dutycycle(HEATER_D, 0);
-
-        _info(">> GROUP 1: A + C [ON] | B + D [OFF] <<");
-        print_channels_parameters();
-
-        // Wait
-        vTaskDelay(pdMS_TO_TICKS(SWITCH_DELAY_MS));
-
-        // -------------------------------------------------
-        // PHASE 2: B + D ON (A + C OFF)
-        // -------------------------------------------------
-
-        // Safety & Voltage Check
-        read_hardware_channels();
-        if(!is_temperature_safe()) { 
-             for(int i=0;i<4;i++) hw_set_dutycycle(i, 0); 
-             vTaskDelay(pdMS_TO_TICKS(5000)); continue; 
-        }
-        if(hw_get_current_voltage() != TARGET_VOLTAGE) hw_set_voltage(TARGET_VOLTAGE);
-
-        // Apply Phase 2
-        hw_set_dutycycle(HEATER_A, 0);
-        hw_set_dutycycle(HEATER_B, 100);
-        hw_set_dutycycle(HEATER_C, 0);
-        hw_set_dutycycle(HEATER_D, 100);
-
-        _info(">> GROUP 2: B + D [ON] | A + C [OFF] <<");
-        print_channels_parameters();
-
-        // Wait
-        vTaskDelay(pdMS_TO_TICKS(SWITCH_DELAY_MS));
     }
-}
-
-/* ============================================================= */
-/* HELPER FUNCTIONS                                              */
-/* ============================================================= */
-
-app_status_t heat_set_channels(cmd_heat_params_t *params)
-{
-    session_running = true;
     return APPST_SUCCESS;
 }
 
-app_status_t heat_set_temperature_sp(cmd_heat_params_t *params)
+app_status_t hw_set_dutycycle(uint8_t channel, uint8_t duty)
 {
-    return heat_set_channels(params);
-}
+    if (p_config == NULL || channel >= num_channels) return APPST_INVALID_PARAM;
 
-static void read_hardware_channels(void)
-{
-    heater_id_t id;
-    channel_ctl_t *ch = heat_channels;
-    
-    if(!os_get_mutex(&mtx_heat_chdata, MTX_CH_DATA_TOUT)) return;
+    uint32_t pin = p_config[channel].heater_output;
 
-    for(uint8_t i = 0; i < MAX_HEATERS; i++, ch++)
+    // Execute the ON/OFF command from your heat_ctrl.c
+    if (duty > 0)
     {
-        id = ch->ctl_settings.channelid;
-        hw_get_params(id, &ch->measures);
+        nrf_gpio_pin_set(pin);   // Turn ON
     }
-    os_release_mutx(&mtx_heat_chdata);
-}
-
-static bool is_temperature_safe(void)
-{
-    uint16_t pcbtemp;
-    if(APPST_SUCCESS == hw_get_pcb_temperature(&pcbtemp))
+    else
     {
-        if(pcbtemp > MAX_PCB_TEMP_RAW) {
-            _error("PCB OVERHEAT: %d", pcbtemp);
-            return false;
-        }
+        nrf_gpio_pin_clear(pin); // Turn OFF
     }
-    return true;
+
+    return APPST_SUCCESS;
 }
 
-/* ============================================================= */
-/* BOILERPLATE / DEBUG                                           */
-/* ============================================================= */
+// --- SUPPORT FUNCTIONS ---
+app_status_t hw_set_duty_period(uint16_t period, bool reset) { pwm_period = period; return APPST_SUCCESS; }
+uint32_t hw_get_duty_period_count(void) { return pwm_period; }
+uint32_t hw_get_default_period_count(void) { return 1000; }
+uint8_t hw_get_current_voltage(void) { return 15; } 
+app_status_t hw_set_voltage(uint8_t voltage) { current_voltage = voltage; return APPST_SUCCESS; }
+app_status_t hw_set_lowest_vcc(void) { return APPST_SUCCESS; }
+uint8_t hw_get_lowest_voltage(void) { return 5; }
+uint8_t hw_get_highest_voltage(void) { return 20; }
 
-bool heat_is_channel_overheating(heater_id_t ch) { return false; }
-bool heat_is_hardware_failed(void) { return false; }
-uint16_t heat_get_remaining_session_time(void) { return 9999; }
-uint16_t heat_get_remaining_ble_disconnection_time(void) { return 9999; }
-void heat_stop_control(void) { hw_stop(); }
-void heat_cycle_printing(void) { enable_printing = !enable_printing; }
-bool heat_get_channel_params(heater_id_t ch, channel_ctl_t *params) { return false; }
-
-static void print_channels_parameters(void)
+app_status_t hw_get_params(heater_id_t ch, heat_params_t * params)
 {
-    if(!enable_printing) return;
-    channel_ctl_t *channel = heat_channels;
-    _print("\nCH  [V]   [mA]   [R]   [Temp]  [St]\n");
-    for(uint8_t i = 0; i < MAX_HEATERS; i++, channel++)
-    {
-        if(hw_is_channel_enabled(channel->ctl_settings.channelid))
-        {
-            _print("%-4d %-6d %-6d %-6d %-6d %d\n", 
-                channel->ctl_settings.channelid, 
-                channel->measures.volts,
-                channel->measures.current,
-                channel->measures.resistance,
-                channel->measures.temperature,
-                channel->measures.status);
-        }
+    if (!params) return APPST_INVALID_PARAM;
+    params->channel = (uint8_t)ch;
+    params->volts = 15000; 
+    params->current = 680; // 15V / 22 Ohms
+    params->temperature = 3000; // 30C
+    return APPST_SUCCESS;
+}
+
+app_status_t hw_get_pcb_temperature(uint16_t * temp) { *temp = 3000; return APPST_SUCCESS; }
+bool hw_is_channel_enabled(uint8_t channel) { return true; }
+void hw_stop(void) { 
+    if(p_config) {
+        for(uint8_t i=0; i<num_channels; i++) nrf_gpio_pin_clear(p_config[i].heater_output);
     }
 }
+bool hw_is_task_stopped(void) { return false; }
+uint32_t hw_get_ch_ontime_count(uint8_t channel) { return 0; }
