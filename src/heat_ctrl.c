@@ -21,8 +21,8 @@
 /* ========================================== */
 /* USER CONFIGURATION                         */
 /* ========================================== */
-#define TARGET_VOLTAGE      15     // 5V is SAFE for 2 channels (12.5W total)
-#define SWITCH_DELAY_MS     10000  // 5 Seconds switching time
+#define TARGET_VOLTAGE      5     // 5V is SAFE for 2 channels (12.5W total)
+#define SWITCH_DELAY_MS     25000  // 5 Seconds switching time
 #define MAX_PCB_TEMP_RAW    8500  // 85C Safety Cutoff
 
 /* ========================================== */
