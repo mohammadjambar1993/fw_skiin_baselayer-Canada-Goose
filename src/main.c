@@ -1,226 +1,119 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include "adc_ctrl.h"
+
 #include "appconfig.h"
-#include "sdk_config.h"
 #include "hal_config.h"
 #include "hal_gpio.h"
 #include "FreeRTOS.h"
-#include "semphr.h"
 #include "logger.h"
 #include "logio.h"
 #include "mya_util.h"
-#include "nrf_soc.h"
-#include "ble_rpc.h"
-#include "tskctrl.h"
-#include "nrf_sdm.h"
 #include "heat_ctrl.h"
-#include "heater.h"  // Access to hw_ functions
-#include "cli.h"
 #include "pmic.h"
 #include "wdt.h"
 #include "gtk_spi.h"
-#include "hal_i2c.h"
-#include "crc16.h"
-#include "drivers/ina231.h"
-#include "diagnostic.h"
-#include "nrf52833.h"
-#include "nrf.h"
 #include "system.h"
-#include "temperature_ads.h"
+#include "nrf_sdm.h"
 
-// Forward Declarations
-void show_reset(void);
-void pins_init(void);
-void config_uicr(void);
-void config_ram_ret(void);
-
-// ---------------------------------------------------------
-// SMART START TASK: Wait for BLE, then FORCE MAX HEAT
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// AUTO-START: 2 CHANNELS (A & B) @ MAX POWER
-// NO PHONE REQUIRED
-// ---------------------------------------------------------
-void auto_start_heat_task(void * pvParameters)
-{
-    // 1. Wait 3 seconds for power bank to wake up
-    vTaskDelay(pdMS_TO_TICKS(3000)); 
-
-    log_info(">> STARTING: DUAL CHANNEL MAX HEAT <<");
-
-    cmd_heat_params_t auto_params;
-    memset(&auto_params, 0, sizeof(cmd_heat_params_t));
-
-    // Set duration to 12 hours
-    auto_params.timeout_secs = 43200; 
-
-    // --- VOLTAGE SETTING ---
-    // Start with default Voltage (usually 5V).
-    // 2 Channels @ 5V = ~12 Watts (Good Heat).
-    // If you change this to 9, you might crash the battery (38 Watts!).
-    auto_params.voltage = hw_get_current_voltage(); 
-    auto_params.pwm_period = hw_get_default_period_count();
-
-    // --- POWER SETTING ---
-    // We turn ON Channel A (0) and Channel B (1) to 100%
-    // We turn OFF Channel C (2) and Channel D (3) to save battery
-    
-    auto_params.data[0] = 100; // Channel A -> MAX
-    auto_params.data[1] = 100; // Channel B -> MAX
-    auto_params.data[2] = 0;   // Channel C -> OFF
-    auto_params.data[3] = 0;   // Channel D -> OFF
-
-    // Send Command
-    app_status_t status = heat_set_channels(&auto_params);
-
-    if (status == APPST_SUCCESS) {
-        log_info(">> SUCCESS: Channels A & B set to 100% <<");
-    } else {
-        log_error(">> ERROR: %d <<", status);
-    }
-
-    // Monitor Voltage in Logs
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        uint16_t v = hw_get_current_voltage();
-        log_info(">> VOLTAGE CHECK: %d mV <<", v);
-    }
-}
-// ---------------------------------------------------------
+/* FORWARD DECLARATIONS */
+static void show_reset(void);
+static void pins_init(void);
+static void config_uicr(void);
+static void start_brute_force_heating(void);
 
 int main(void)
 {
     hal_config_init();
     config_uicr();
-    
+
     if(IOST_MAP_OK != hal_gpio_init())
         log_error(">> IO MAP ERROR <<\r\n");
-        
+
     pins_init();
     log_init(LEVEL_DEBUG, LOG_SEGGER_RTT);
     logio_init();
-    
-    if(!gtk_spi_init())
-        log_error(">> fail to init SPI GTK <<\r\n");
-        
+
+    if(!gtk_spi_init()) log_error(">> fail SPI <<\r\n");
+
     show_reset();
     diag_init();
-    
-    if (!pmic_init())  // Initialize i2c and power bank communication
-        log_error(">> fail to init pmic <<\r\n");
-        
-    util_blocking_delay_ms(5);  // wait for stability
-
+    pmic_init();
+    util_blocking_delay_ms(5);
     sys_init();
-    ble_init();
-    cli_init();
 
+    /* NO BLE INIT */
+    // ble_init(); 
+
+    cli_init();
     wdt_init();
     wdt_start();
-    
-    if(!os_init())
-        log_error(">> Failed to initialize OS <<\r\n");
 
-    // ----------------------------------------------------
-    // CREATE THE AUTO-HEAT TASK
-    // ----------------------------------------------------
-    // This creates the task defined above that waits for BLE
-    xTaskCreate(auto_start_heat_task, "AutoHeat", 256, NULL, 1, NULL);
-    // ----------------------------------------------------
+    if(!os_init()) log_error(">> Failed OS <<\r\n");
+
+    /* HEAT CONTROLLER INIT */
+    if(APPST_SUCCESS != heat_init())
+        log_error(">> Failed heat init <<\r\n");
+
+    /* START IMMEDIATELY */
+    start_brute_force_heating();
 
     vTaskStartScheduler();
-    
-    while(1) // Should never reach here
-    {
-        // Turn all leds on to indicate crash/error
-        hal_gpio_clr(LED_R);
-        hal_gpio_clr(LED_G);
-        hal_gpio_clr(LED_B);
-    }
+
+    while(1) { }
 }
 
-#define TOGGLE_COUNTER  4
-void show_reset(void)
+static void start_brute_force_heating(void)
 {
-    volatile uint8_t i;
-    // Turn all leds off (High = Off for common anode)
-    hal_gpio_set(LED_R);
-    hal_gpio_set(LED_G);
-    hal_gpio_set(LED_B);
+    // The params don't matter because heat_ctrl.c is hardcoded 
+    // to Channel B / 45C / Max Power.
+    cmd_heat_params_t params = {0};
+    
+    // Just trigger the session
+    heat_set_channels(&params); 
+    
+    log_info(">>> BRUTE FORCE HEATING STARTED <<<");
+}
 
-    for(i = 0; i < TOGGLE_COUNTER; i++)
+/* ============================================================= */
+/* BOILERPLATE                              */
+/* ============================================================= */
+
+#define TOGGLE_COUNTER 4
+static void show_reset(void)
+{
+    hal_gpio_set(LED_R); hal_gpio_set(LED_G); hal_gpio_set(LED_B);
+    for(uint8_t i = 0; i < TOGGLE_COUNTER; i++)
     {
-        hal_gpio_toggle(LED_R);
-        hal_gpio_toggle(LED_G);
-        hal_gpio_toggle(LED_B);
+        hal_gpio_toggle(LED_R); hal_gpio_toggle(LED_G); hal_gpio_toggle(LED_B);
         util_blocking_delay_ms(100);
     }
-    log_info(">>RESET<<");
+    log_info(">> RESET <<");
 }
 
-void pins_init(void)
+static void pins_init(void)
 {
     hal_gpio_set(CS_IMU);
     hal_gpio_set(CS_MEM);
 }
 
-#define FPU_EXCEPTION_MASK  0x0000009F
 void vApplicationIdleHook(void)
 {
-    while(1)
-    {
-        // Clear FPU irq flags in order to let the core to sleep
-        __set_FPSCR(__get_FPSCR()  & ~(FPU_EXCEPTION_MASK));
-        (void) __get_FPSCR();
-        NVIC_ClearPendingIRQ(FPU_IRQn);
+    while(1) { sd_app_evt_wait(); }
+}
 
-        sd_app_evt_wait();
+static void config_uicr(void)
+{
+    if(0xFFFFFFFE != NRF_UICR->NFCPINS)
+    {
+        NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos);
+        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
+        NRF_UICR->NFCPINS = 0xFFFFFFFE;
+        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
+        NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos);
+        while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
     }
 }
 
-void write_uicr(uint32_t *address, uint32_t value)
-{
-    // Turn on flash write enable and wait until the NVMC is ready
-    NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos);
-    while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-    
-    // Write memory
-    *address = value;
-    while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-    
-    // Turn off flash write enable and wait until the NVMC is ready
-    NRF_NVMC->CONFIG = (NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos);
-    while (NRF_NVMC->READY == NVMC_READY_READY_Busy);
-}
-
-void config_uicr(void)
-{
-#if CONFIG_UICR == 1
-    if(0xFFFFFF00 != NRF_UICR->APPROTECT) // Disable debugger access protection if needed
-        write_uicr((uint32_t*)&NRF_UICR->APPROTECT, 0xFFFFFF00);
-    if(0xFFFFFFFE != NRF_UICR->NFCPINS) // Configure NFC pins as standard gpios
-        write_uicr((uint32_t*)&NRF_UICR->NFCPINS, 0xFFFFFFFE);
-#endif
-    if(0xFFFFFFFE != NRF_UICR->NFCPINS) // Ensure NFC pins are GPIOs
-        write_uicr((uint32_t*)&NRF_UICR->NFCPINS, 0xFFFFFFFE);
-}
-
-// Stack overflow check
-void vApplicationStackOverflowHook(TaskHandle_t *task, signed char *taskName)
-{
-    while(1)
-    {
-        __NOP();
-    }
-}
-
-// Malloc failed hook
-void vApplicationMallocFailedHook(void)
-{
-    while(1)
-    {
-        __NOP();
-    }
-}
+void vApplicationStackOverflowHook(TaskHandle_t *task, signed char *taskName) { while(1); }
+void vApplicationMallocFailedHook(void) { while(1); }
