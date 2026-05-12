@@ -75,7 +75,7 @@ bool pmic_init(void)
     }
     else
     {
-    	//tps_neg_contract(DEFAULT_VOLTAGE);//set default voltage:5v
+    	tps_neg_contract(DEFAULT_VOLTAGE);//set default voltage:5v
     	tps_read_batt_range(&batt_range);
     	tps_read_batt_level(&batt_level);
        	tskhnd = tsk_create(TSK_PMIC_WDT, tsk_pmic_wdt);
